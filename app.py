@@ -89,14 +89,6 @@ st.sidebar.title("Plant parameters")
 persisted = load_persisted_state()
 persisted_params = persisted.get("params", {})
 
-if st.sidebar.button("Reset saved state"):
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-    if UPLOADED_DATA_FILE.exists():
-        UPLOADED_DATA_FILE.unlink()
-    st.cache_data.clear()
-    st.rerun()
-
 uploaded = st.sidebar.file_uploader(
     "Hourly demand CSV (optional)", type=["csv"],
     help="Must contain columns 'timestamp' and 'cng_nm3'. Defaults to the ZF Passau 2023 profile.",
