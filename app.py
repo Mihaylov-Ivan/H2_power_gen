@@ -9,6 +9,7 @@ Run:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,6 +22,8 @@ import streamlit as st
 from h2plant import PlantParams, simulate, evaluate_economics, sweep
 
 DATA_FILE = Path(__file__).parent / "data" / "demand_hourly.csv"
+STATE_FILE = Path(__file__).parent / "data" / "app_state.json"
+UPLOADED_DATA_FILE = Path(__file__).parent / "data" / "uploaded_demand.csv"
 
 st.set_page_config(
     page_title="H2 Power Generation Simulator",
@@ -37,6 +40,25 @@ def load_demand(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df
+
+
+def load_persisted_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_persisted_state(state: dict, uploaded_df: pd.DataFrame | None = None) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if uploaded_df is not None:
+        uploaded_df.to_csv(UPLOADED_DATA_FILE, index=False)
+    with STATE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
 
 @st.cache_data(show_spinner=False)
@@ -64,6 +86,17 @@ def eur(x: float, digits: int = 0) -> str:
 # --------------------------------------------------------------------------- #
 st.sidebar.title("Plant parameters")
 
+persisted = load_persisted_state()
+persisted_params = persisted.get("params", {})
+
+if st.sidebar.button("Reset saved state"):
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+    if UPLOADED_DATA_FILE.exists():
+        UPLOADED_DATA_FILE.unlink()
+    st.cache_data.clear()
+    st.rerun()
+
 uploaded = st.sidebar.file_uploader(
     "Hourly demand CSV (optional)", type=["csv"],
     help="Must contain columns 'timestamp' and 'cng_nm3'. Defaults to the ZF Passau 2023 profile.",
@@ -71,80 +104,91 @@ uploaded = st.sidebar.file_uploader(
 if uploaded is not None:
     demand = pd.read_csv(uploaded)
     demand["timestamp"] = pd.to_datetime(demand["timestamp"])
+    demand_source = "uploaded"
+elif persisted.get("use_uploaded_data") and UPLOADED_DATA_FILE.exists():
+    demand = load_demand(str(UPLOADED_DATA_FILE))
+    demand_source = "persisted-uploaded"
 else:
     demand = load_demand(str(DATA_FILE))
+    demand_source = "default"
 
 base_annual_nm3 = float(demand["cng_nm3"].sum())
 
 d = PlantParams()  # defaults
 
 with st.sidebar.expander("Demand", expanded=True):
+    persisted_demand_target = persisted.get("demand_target_nm3")
+    default_demand_target = (
+        float(persisted_demand_target)
+        if persisted_demand_target is not None
+        else float(round(base_annual_nm3))
+    )
     demand_target = st.number_input(
         "Design annual CNG demand (Nm3/yr)",
-        min_value=0.0, value=float(round(base_annual_nm3)), step=1000.0,
+        min_value=0.0, value=default_demand_target, step=1000.0,
         help=f"Metered 2023 profile sums to {base_annual_nm3:,.0f} Nm3. "
              f"Enter a different value (e.g. 401,449 for the max scenario) to scale the profile.",
     )
     demand_scale = demand_target / base_annual_nm3 if base_annual_nm3 else 1.0
     h2_burner_rel_eff = st.slider(
-        "H2 burner efficiency vs CNG", 0.7, 1.2, d.h2_burner_rel_eff, 0.01,
+        "H2 burner efficiency vs CNG", 0.7, 1.2, float(persisted_params.get("h2_burner_rel_eff", d.h2_burner_rel_eff)), 0.01,
         help="Useful heat delivered per kWh LHV: H2 burner relative to the CNG burner.",
     )
 
 with st.sidebar.expander("Electrolyzer (alkaline)", expanded=True):
-    elx_power_mw = st.slider("ELX rated power (MW)", 0.25, 6.0, d.elx_power_mw, 0.05)
+    elx_power_mw = st.slider("ELX rated power (MW)", 0.25, 6.0, float(persisted_params.get("elx_power_mw", d.elx_power_mw)), 0.05)
     elx_spec_energy = st.slider(
-        "ELX specific energy (kWh/kg H2)", 45.0, 65.0, d.elx_spec_energy, 0.1,
+        "ELX specific energy (kWh/kg H2)", 45.0, 65.0, float(persisted_params.get("elx_spec_energy", d.elx_spec_energy)), 0.1,
         help="55.5 kWh/kg -> 60% LHV efficiency.",
     )
     elx_hours_per_day = st.slider(
-        "Operating hours / day", 1, 24, d.elx_hours_per_day,
+        "Operating hours / day", 1, 24, int(persisted_params.get("elx_hours_per_day", d.elx_hours_per_day)),
         help="Hours the ELX runs. >=14 h OFF means <=10 h ON.",
     )
-    elx_start_hour = st.slider("Start hour", 0, 23, d.elx_start_hour)
-    operate_weekends = st.checkbox("Operate weekends", d.operate_weekends)
+    elx_start_hour = st.slider("Start hour", 0, 23, int(persisted_params.get("elx_start_hour", d.elx_start_hour)))
+    operate_weekends = st.checkbox("Operate weekends", bool(persisted_params.get("operate_weekends", d.operate_weekends)))
     elx_load_follow = st.checkbox(
-        "Load-follow (minimise waste)", d.elx_load_follow,
+        "Load-follow (minimise waste)", bool(persisted_params.get("elx_load_follow", d.elx_load_follow)),
         help="ON: ELX only draws power for H2 it can use/store. "
              "OFF: full rated power the whole window (matches spreadsheet, surplus H2 vented).",
     )
 
 with st.sidebar.expander("Waste-heat recovery", expanded=False):
     wh_recovery_frac = st.slider(
-        "Recovered heat (fraction of ELX power)", 0.0, 0.40, d.wh_recovery_frac, 0.01,
+        "Recovered heat (fraction of ELX power)", 0.0, 0.40, float(persisted_params.get("wh_recovery_frac", d.wh_recovery_frac)), 0.01,
         help="Usable process heat as a share of ELX electrical input. Physical ceiling ~0.40.",
     )
 
 with st.sidebar.expander("Compressor (200 bar)", expanded=False):
-    comp_spec_energy = st.slider("Compressor energy (kWh/kg)", 0.5, 4.0, d.comp_spec_energy, 0.1)
+    comp_spec_energy = st.slider("Compressor energy (kWh/kg)", 0.5, 4.0, float(persisted_params.get("comp_spec_energy", d.comp_spec_energy)), 0.1)
     comp_power_kw = st.number_input(
-        "Compressor rated power (kW, 0=auto)", min_value=0.0, value=d.comp_power_kw, step=10.0,
+        "Compressor rated power (kW, 0=auto)", min_value=0.0, value=float(persisted_params.get("comp_power_kw", d.comp_power_kw)), step=10.0,
     )
 
 with st.sidebar.expander("Storage (200 bar trailer)", expanded=False):
     storage_capacity_kg = st.slider(
-        "Storage capacity (kg H2)", 50.0, 3000.0, d.storage_capacity_kg, 10.0,
+        "Storage capacity (kg H2)", 50.0, 3000.0, float(persisted_params.get("storage_capacity_kg", d.storage_capacity_kg)), 10.0,
     )
-    storage_init_frac = st.slider("Initial state of charge", 0.0, 1.0, d.storage_init_frac, 0.05)
-    allow_cng_backup = st.checkbox("Allow CNG backup for uncovered hours", d.allow_cng_backup)
+    storage_init_frac = st.slider("Initial state of charge", 0.0, 1.0, float(persisted_params.get("storage_init_frac", d.storage_init_frac)), 0.05)
+    allow_cng_backup = st.checkbox("Allow CNG backup for uncovered hours", bool(persisted_params.get("allow_cng_backup", d.allow_cng_backup)))
 
 with st.sidebar.expander("Prices", expanded=False):
-    elec_price_eur_mwh = st.number_input("Electricity (EUR/MWh)", value=d.elec_price_eur_mwh, step=1.0)
-    cng_price_eur_mwh = st.number_input("CNG (EUR/MWh)", value=d.cng_price_eur_mwh, step=1.0)
-    co2_price_eur_t = st.number_input("CO2 (EUR/t)", value=d.co2_price_eur_t, step=5.0)
-    co2_cng_t_per_mwh = st.number_input("CNG emission factor (tCO2/MWh)", value=d.co2_cng_t_per_mwh, step=0.001, format="%.3f")
+    elec_price_eur_mwh = st.number_input("Electricity (EUR/MWh)", value=float(persisted_params.get("elec_price_eur_mwh", d.elec_price_eur_mwh)), step=1.0)
+    cng_price_eur_mwh = st.number_input("CNG (EUR/MWh)", value=float(persisted_params.get("cng_price_eur_mwh", d.cng_price_eur_mwh)), step=1.0)
+    co2_price_eur_t = st.number_input("CO2 (EUR/t)", value=float(persisted_params.get("co2_price_eur_t", d.co2_price_eur_t)), step=5.0)
+    co2_cng_t_per_mwh = st.number_input("CNG emission factor (tCO2/MWh)", value=float(persisted_params.get("co2_cng_t_per_mwh", d.co2_cng_t_per_mwh)), step=0.001, format="%.3f")
 
 with st.sidebar.expander("CAPEX", expanded=False):
-    capex_elx_eur_per_kw = st.number_input("Electrolyzer (EUR/kW)", value=d.capex_elx_eur_per_kw, step=50.0)
-    capex_comp_eur_per_kw = st.number_input("Compressor (EUR/kW)", value=d.capex_comp_eur_per_kw, step=100.0)
-    capex_storage_eur_per_kg = st.number_input("Storage (EUR/kg)", value=d.capex_storage_eur_per_kg, step=50.0)
-    capex_bop_eur = st.number_input("Balance of plant (EUR)", value=d.capex_bop_eur, step=10000.0)
+    capex_elx_eur_per_kw = st.number_input("Electrolyzer (EUR/kW)", value=float(persisted_params.get("capex_elx_eur_per_kw", d.capex_elx_eur_per_kw)), step=50.0)
+    capex_comp_eur_per_kw = st.number_input("Compressor (EUR/kW)", value=float(persisted_params.get("capex_comp_eur_per_kw", d.capex_comp_eur_per_kw)), step=100.0)
+    capex_storage_eur_per_kg = st.number_input("Storage (EUR/kg)", value=float(persisted_params.get("capex_storage_eur_per_kg", d.capex_storage_eur_per_kg)), step=50.0)
+    capex_bop_eur = st.number_input("Balance of plant (EUR)", value=float(persisted_params.get("capex_bop_eur", d.capex_bop_eur)), step=10000.0)
 
 with st.sidebar.expander("OPEX & Finance", expanded=False):
-    opex_maint_pct = st.slider("Maintenance (% CAPEX/yr)", 0.0, 10.0, d.opex_maint_pct, 0.5)
-    opex_fixed_eur = st.number_input("Other fixed OPEX (EUR/yr)", value=d.opex_fixed_eur, step=5000.0)
-    project_years = st.slider("Project lifetime (yr)", 5, 30, d.project_years)
-    discount_rate = st.slider("Discount rate", 0.0, 0.20, d.discount_rate, 0.005)
+    opex_maint_pct = st.slider("Maintenance (% CAPEX/yr)", 0.0, 10.0, float(persisted_params.get("opex_maint_pct", d.opex_maint_pct)), 0.5)
+    opex_fixed_eur = st.number_input("Other fixed OPEX (EUR/yr)", value=float(persisted_params.get("opex_fixed_eur", d.opex_fixed_eur)), step=5000.0)
+    project_years = st.slider("Project lifetime (yr)", 5, 30, int(persisted_params.get("project_years", d.project_years)))
+    discount_rate = st.slider("Discount rate", 0.0, 0.20, float(persisted_params.get("discount_rate", d.discount_rate)), 0.005)
 
 params = dict(
     demand_scale=demand_scale,
@@ -179,6 +223,15 @@ sim, eco = run_sim(demand, params)
 s = sim.summary
 h = sim.hourly
 
+save_persisted_state(
+    {
+        "demand_target_nm3": float(demand_target),
+        "use_uploaded_data": demand_source in ("uploaded", "persisted-uploaded"),
+        "params": params,
+    },
+    uploaded_df=demand if demand_source == "uploaded" else None,
+)
+
 # --------------------------------------------------------------------------- #
 # Header
 # --------------------------------------------------------------------------- #
@@ -188,6 +241,8 @@ st.caption(
     "(alkaline electrolyzer + waste-heat recovery + 200 bar storage). "
     "All inputs are editable in the sidebar."
 )
+if demand_source == "persisted-uploaded":
+    st.info("Using last uploaded hourly CSV restored from saved app state.")
 
 # top-line KPIs
 k1, k2, k3, k4, k5 = st.columns(5)
